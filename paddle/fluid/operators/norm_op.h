@@ -65,13 +65,13 @@ class NormKernel : public framework::OpKernel<T> {
     // y = x / sqrt((sum(x * x) + epsilon))
     // norm = sqrt(sum(x * x) + epsilon)
     auto x2 = x * x;
-    auto sum = x2.sum(rdim) + eps;
+    auto sum = x2.sum(rdim).cwiseMax(eps);
     norm.device(*place) = sum.sqrt();
 
     // y = x / norm
     Eigen::DSizes<int, 3> rshape(pre, 1, post);
     Eigen::DSizes<int, 3> bcast(1, n, 1);
-    y.device(*place) = x / norm.reshape(rshape).broadcast(bcast);
+    y.device(*place) = x / norm.reshape(rshape).eval().broadcast(bcast);
   }
 };
 
@@ -83,6 +83,7 @@ class NormGradKernel : public framework::OpKernel<T> {
     auto* in_norm = ctx.Input<framework::Tensor>("Norm");
     auto* in_dy = ctx.Input<framework::Tensor>(framework::GradVarName("Out"));
     auto* out_dx = ctx.Output<framework::Tensor>(framework::GradVarName("X"));
+    T eps = static_cast<T>(ctx.Attr<float>("epsilon"));
     out_dx->mutable_data<T>(ctx.GetPlace());
 
     auto xdim = in_x->dims();
@@ -100,11 +101,13 @@ class NormGradKernel : public framework::OpKernel<T> {
 
     Eigen::DSizes<int, 3> shape(pre, n, post);
     Eigen::DSizes<int, 3> rshape(pre, 1, post);
+
     auto x = x_e.reshape(shape);
     auto dy = dy_e.reshape(shape);
     auto norm = norm_e.reshape(rshape);
     auto dx = dx_e.reshape(shape);
 
+    Eigen::DSizes<int, 2> reduced_shape(pre, post);
     framework::Tensor rsum;
     rsum.mutable_data<T>({pre, post}, ctx.GetPlace());
     auto sum = framework::EigenTensor<T, 2>::From(rsum);
@@ -112,18 +115,26 @@ class NormGradKernel : public framework::OpKernel<T> {
     Eigen::DSizes<int, 1> rdim(1);
     Eigen::DSizes<int, 3> bcast(1, n, 1);
 
-    // dx = ( dy/sqrt(sum(x*x)) ) * [1 - x*sum(x) / (sum(x*x) + e)]
-    //    = [dy - dy * x * sum(x) / (sum(x*x) + e)] / sqrt(sum(x*x))
-    //    = [dy - x * sum(x*dy) / (sum(x*x) + e)] / sqrt(sum(x*x))
-    // 1. sum = sum(x*dy)
-    sum.device(*place) = (x * dy).sum(rdim);
+    framework::Tensor cond;
+    cond.mutable_data<bool>({pre, post}, ctx.GetPlace());
+    auto cond_ = framework::EigenTensor<bool, 2>::From(cond);
+    cond_.device(*place) = norm_e.reshape(reduced_shape) > eps;
+
+    framework::Tensor zero;
+    zero.mutable_data<T>({pre, post}, ctx.GetPlace());
+    auto zero_ = framework::EigenTensor<T, 2>::From(zero);
+    zero_.setZero();
+
+    // 1. sum = norm > eps ? sum(x*dy) : 0
+    sum.device(*place) =
+        cond_.select((x * dy).sum(rdim).reshape(rshape), zero_);
     // 2. dx = x * sum
-    dx.device(*place) = sum.reshape(rshape).broadcast(bcast) * x;
+    dx.device(*place) = sum.reshape(rshape).eval().broadcast(bcast) * x;
     // 3. dx / (sum(x*x) + e)
     // where, norm.pow(2) = sum(x*x) + e, which is calculated in forward.
-    dx.device(*place) = dx / norm.pow(2).broadcast(bcast);
+    dx.device(*place) = dx / norm.pow(2).eval().broadcast(bcast);
     // 4. [dy - dx] / sqrt(sum(x*x))
-    dx.device(*place) = (dy - dx) / norm.broadcast(bcast);
+    dx.device(*place) = (dy - dx) / norm.eval().broadcast(bcast);
   }
 };
 }  // namespace operators
